@@ -1,5 +1,6 @@
 pyTelegramBotAPI
 requests
 flask
-bs4
+beautifulsoup4
 fake-useragent
+urllib3
