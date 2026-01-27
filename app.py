@@ -324,25 +324,58 @@ def handle_start(m): bot.reply_to(m, "👺 <b>GOD MODE</b>\n1. Upload Proxies\n2
 def handle_doc(m):
     if str(m.from_user.id) != str(OWNER_ID): return
     try:
+        file_name = m.document.file_name.lower()
         file_info = bot.get_file(m.document.file_id)
         data = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
-        lines = [x.strip() for x in data.split('\n') if len(x.strip()) > 5]
         
-        is_proxy = any(x in lines[0] for x in [':', '@']) and len(lines[0].split(':')) >= 2
-        
-        if is_proxy:
-            proxies = []
-            if m.document.file_name.endswith('.csv'):
-                import io
-                reader = csv.DictReader(io.StringIO(data))
-                for r in reader: 
-                    if r.get('host'): proxies.append(f"http://{r['username']}:{r['password']}@{r['host']}:{r['port']}")
-            else: proxies = lines
-            threading.Thread(target=run_proxy_checker_job, args=(m, proxies)).start()
+        proxies = []
+        is_proxy_file = False
+
+        # 1. CSV DETECTION (Check filename first!)
+        if file_name.endswith('.csv'):
+            is_proxy_file = True
+            import io
+            # Use strict parsing for your specific headers
+            reader = csv.DictReader(io.StringIO(data))
+            for r in reader:
+                # Handle keys safely (strip spaces)
+                row = {k.strip(): v.strip() for k, v in r.items() if k}
+                
+                # specific check for your file structure
+                host = row.get('host') or row.get('ip')
+                port = row.get('port')
+                user = row.get('username') or row.get('user')
+                pwd = row.get('password') or row.get('pass')
+
+                if host and port and user and pwd:
+                    proxies.append(f"http://{user}:{pwd}@{host}:{port}")
+
+        # 2. TXT DETECTION (Check content pattern)
         else:
-            threading.Thread(target=run_main_job, args=(m, lines)).start()
-    except Exception as e: bot.reply_to(m, f"❌ Error: {e}")
+            lines = [x.strip() for x in data.split('\n') if len(x.strip()) > 5]
+            # If first line has ':' or '@' and isn't a website, it's a proxy list
+            first_line = lines[0] if lines else ""
+            if (':' in first_line or '@' in first_line) and not first_line.startswith("http"):
+                is_proxy_file = True
+                proxies = lines
+            else:
+                # Otherwise, it's a Site List
+                threading.Thread(target=run_main_job, args=(m, lines)).start()
+                return
+
+        # 3. EXECUTE PROXY CHECKER
+        if is_proxy_file:
+            if proxies:
+                bot.reply_to(m, f"📥 <b>Imported {len(proxies)} Proxies</b>\n<i>Starting Checker...</i>", parse_mode='HTML')
+                threading.Thread(target=run_proxy_checker_job, args=(m, proxies)).start()
+            else:
+                bot.reply_to(m, "⚠️ <b>CSV Error:</b> Could not find 'host', 'port', 'username', 'password' headers.")
+
+    except Exception as e:
+        bot.reply_to(m, f"❌ <b>Error:</b> {str(e)}", parse_mode='HTML')
+
 
 if __name__ == "__main__":
     start_keep_alive()
     bot.infinity_polling()
+
