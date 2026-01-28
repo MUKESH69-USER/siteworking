@@ -28,7 +28,7 @@ CHUNK_SIZE = 300  # ⬇️ 500 → 300 (FASTER CHUNKS)
 PROXY_CHECK_THREADS = 150  # ⬆️ 100 → 150 (PARALLEL PROXY CHECK)
 REQUEST_TIMEOUT = 12  # ⬇️ 15 → 12 (FASTER TIMEOUTS)
 BATCH_LIVE_LIMIT = 50  # ⬇️ 100 → 50 (SEND RESULTS FASTER)
-USER_AGENT_ROTATOR = UserAgent()
+USER_AGENT_ROTATOR = UserAgent(fallback='Mozilla/5.0')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -591,3 +591,4 @@ if __name__ == "__main__":
     start_keep_alive()
     logger.info("👹 MONSTER v4 Started")
     bot.infinity_polling()
+
