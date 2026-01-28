@@ -28,7 +28,12 @@ CHUNK_SIZE = 300  # ⬇️ 500 → 300 (FASTER CHUNKS)
 PROXY_CHECK_THREADS = 150  # ⬆️ 100 → 150 (PARALLEL PROXY CHECK)
 REQUEST_TIMEOUT = 12  # ⬇️ 15 → 12 (FASTER TIMEOUTS)
 BATCH_LIVE_LIMIT = 50  # ⬇️ 100 → 50 (SEND RESULTS FASTER)
-USER_AGENT_ROTATOR = UserAgent(fallback='Mozilla/5.0')
+try:
+    USER_AGENT_ROTATOR = UserAgent()
+    ua_string = USER_AGENT_ROTATOR.random
+except Exception:
+    ua_string = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -220,7 +225,7 @@ def check_site_ultimate(site_url):
     site_url = clean_url(site_url)
     identity = get_random_identity()
     headers = {
-        'User-Agent': USER_AGENT_ROTATOR.random,
+        '"User-Agent": ua_string,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Upgrade-Insecure-Requests': '1'
     }
@@ -591,4 +596,5 @@ if __name__ == "__main__":
     start_keep_alive()
     logger.info("👹 MONSTER v4 Started")
     bot.infinity_polling()
+
 
